@@ -1,0 +1,322 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Simple P2P File Share (HTML/CSS/JS)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; max-width:900px; margin:24px auto; padding:12px; }
+    h1 { font-size:1.25rem; margin-bottom:6px; }
+    .card { border:1px solid #ddd; border-radius:8px; padding:12px; margin:12px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.03); }
+    label { display:block; margin:8px 0 4px; }
+    button { padding:8px 12px; margin-right:8px; border-radius:6px; border:1px solid #bbb; background:#f7f7f7; cursor:pointer; }
+    textarea { width:100%; height:120px; font-family:monospace; font-size:12px; }
+    input[type="file"] { display:block; margin-top:6px; }
+    progress { width:100%; height:16px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .muted { color:#666; font-size:0.9rem; }
+    .small { font-size:0.9rem; }
+    .log { max-height:120px; overflow:auto; background:#111; color:#fff; padding:8px; font-size:12px; border-radius:6px; }
+    a.download-link { display:inline-block; margin-top:8px; padding:8px 12px; border-radius:6px; background:#2b8cff; color:#fff; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <h1>Simple P2P File Share — HTML/CSS/JS</h1>
+  <div class="card">
+    <div class="muted">Mode: decide whether you're the <strong>Sender</strong> (have the movie) or <strong>Receiver</strong> (will download).</div>
+
+    <label>Pick file to send (Sender):</label>
+    <input id="fileInput" type="file" />
+
+    <div class="row" style="margin-top:10px;">
+      <button id="createOfferBtn">Create Offer (Sender)</button>
+      <button id="createAnswerBtn">Create Answer (Receiver)</button>
+      <button id="setRemoteBtn">Set Remote SDP (paste & set)</button>
+      <button id="resetBtn">Reset</button>
+    </div>
+
+    <label style="margin-top:10px;">Local SDP (copy & send to remote):</label>
+    <textarea id="localSDP" readonly></textarea>
+
+    <label>Remote SDP (paste text received from remote here):</label>
+    <textarea id="remoteSDP" placeholder="Paste remote SDP/answer/offer here..."></textarea>
+  </div>
+
+  <div class="card">
+    <h3>Transfer Status</h3>
+    <div class="small">Upload progress (sender):</div>
+    <progress id="sendProgress" max="100" value="0"></progress>
+    <div id="sendInfo" class="small muted">0 / 0</div>
+
+    <div style="height:8px;"></div>
+
+    <div class="small">Download progress (receiver):</div>
+    <progress id="recvProgress" max="100" value="0"></progress>
+    <div id="recvInfo" class="small muted">0 / 0</div>
+
+    <div id="downloadArea"></div>
+  </div>
+
+  <div class="card">
+    <h3>Log</h3>
+    <div id="log" class="log"></div>
+  </div>
+
+<script>
+(function(){
+  const fileInput = document.getElementById('fileInput');
+  const createOfferBtn = document.getElementById('createOfferBtn');
+  const createAnswerBtn = document.getElementById('createAnswerBtn');
+  const setRemoteBtn = document.getElementById('setRemoteBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const localSDP = document.getElementById('localSDP');
+  const remoteSDP = document.getElementById('remoteSDP');
+  const sendProgress = document.getElementById('sendProgress');
+  const recvProgress = document.getElementById('recvProgress');
+  const sendInfo = document.getElementById('sendInfo');
+  const recvInfo = document.getElementById('recvInfo');
+  const downloadArea = document.getElementById('downloadArea');
+  const logDiv = document.getElementById('log');
+
+  function log(...args){ 
+    const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    logDiv.textContent += s + '\\n';
+    logDiv.scrollTop = logDiv.scrollHeight;
+    console.log(...args);
+  }
+
+  const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }; // public STUN
+  let pc = null;
+  let dataChannel = null;
+  let fileToSend = null;
+
+  // Receiver state
+  let receivedBuffers = [];
+  let expectedFileInfo = null;
+  let receivedBytes = 0;
+
+  const CHUNK_SIZE = 64 * 1024; // 64KB per chunk - adjust if desired
+  const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB backpressure limit
+
+  function resetAll(){
+    if(pc){
+      try{ pc.close(); } catch(e){}
+    }
+    pc = null; dataChannel = null;
+    fileToSend = null;
+    receivedBuffers = []; expectedFileInfo = null; receivedBytes = 0;
+    localSDP.value = ''; remoteSDP.value = '';
+    sendProgress.value = 0; recvProgress.value = 0;
+    sendInfo.textContent = '0 / 0'; recvInfo.textContent = '0 / 0';
+    downloadArea.innerHTML = '';
+    log('Reset done.');
+  }
+  resetBtn.onclick = resetAll;
+
+  fileInput.onchange = e => {
+    if(e.target.files && e.target.files.length) {
+      fileToSend = e.target.files[0];
+      log('Selected file:', fileToSend.name, fileToSend.size + ' bytes');
+      sendInfo.textContent = `0 / ${fileToSend.size} bytes`;
+      sendProgress.value = 0;
+    }
+  };
+
+  function makePeer(createDataChannel){
+    pc = new RTCPeerConnection(config);
+    pc.onicecandidate = e => {
+      // localSDP will be created after setLocalDescription completes; ICE gathers will continue.
+      // We'll output full SDP (including ICE candidates) by waiting a short time after setLocalDescription.
+      log('ICE candidate event', e.candidate ? 'candidate' : '(null)');
+      // nothing else here
+    };
+    pc.onconnectionstatechange = () => log('Connection state:', pc.connectionState);
+    pc.oniceconnectionstatechange = () => log('ICE state:', pc.iceConnectionState);
+
+    if(!createDataChannel){
+      // Receiver: listen for datachannel
+      pc.ondatachannel = ev => {
+        log('DataChannel created by remote:', ev.channel.label);
+        setupDataChannel(ev.channel, false);
+      };
+    } else {
+      // Sender: create datachannel
+      const dc = pc.createDataChannel('fileTransfer');
+      setupDataChannel(dc, true);
+    }
+  }
+
+  function setupDataChannel(dc, isSender){
+    dataChannel = dc;
+    dataChannel.binaryType = 'arraybuffer';
+    dataChannel.onopen = () => {
+      log('DataChannel open —', isSender ? 'Sender' : 'Receiver');
+      if(isSender && fileToSend){
+        sendFileInChunks();
+      }
+    };
+    dataChannel.onclose = () => log('DataChannel closed');
+    dataChannel.onerror = e => log('DataChannel error', e);
+    dataChannel.onmessage = ev => {
+      // Handle incoming messages (control messages or chunk)
+      if(typeof ev.data === 'string'){
+        // Expect JSON control messages
+        try{
+          const msg = JSON.parse(ev.data);
+          if(msg.type === 'file-meta'){
+            expectedFileInfo = msg.info;
+            receivedBuffers = [];
+            receivedBytes = 0;
+            recvProgress.max = expectedFileInfo.size;
+            recvProgress.value = 0;
+            recvInfo.textContent = `0 / ${expectedFileInfo.size} bytes`;
+            log('Receiving file:', expectedFileInfo.name, expectedFileInfo.size);
+          } else if(msg.type === 'file-end'){
+            log('Received file-end signal');
+            finalizeReceivedFile();
+          }
+        }catch(err){
+          log('JSON parse error for text message', err);
+        }
+      } else {
+        // ArrayBuffer chunk
+        receivedBuffers.push(ev.data);
+        receivedBytes += ev.data.byteLength;
+        recvProgress.value = Math.min(recvProgress.max || 1, receivedBytes);
+        recvInfo.textContent = `${receivedBytes} / ${recvProgress.max || 0} bytes`;
+      }
+    };
+  }
+
+  async function sendFileInChunks(){
+    if(!fileToSend || !dataChannel || dataChannel.readyState !== 'open') {
+      log('Cannot send: missing file or dataChannel not open');
+      return;
+    }
+    log('Starting send of', fileToSend.name, fileToSend.size, 'bytes');
+    // Send metadata first
+    const meta = { type: 'file-meta', info: { name: fileToSend.name, size: fileToSend.size, type: fileToSend.type } };
+    dataChannel.send(JSON.stringify(meta));
+
+    const file = fileToSend;
+    const stream = file.stream ? file.stream() : null; // not used, use slice
+    let offset = 0;
+    let chunkCount = 0;
+
+    while(offset < file.size){
+      const slice = file.slice(offset, offset + CHUNK_SIZE);
+      const arrayBuffer = await slice.arrayBuffer();
+      // backpressure control
+      while(dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT){
+        await new Promise(r => setTimeout(r, 200));
+      }
+      dataChannel.send(arrayBuffer);
+      offset += arrayBuffer.byteLength;
+      chunkCount++;
+      sendProgress.max = file.size;
+      sendProgress.value = offset;
+      sendInfo.textContent = `${offset} / ${file.size} bytes`;
+      if(chunkCount % 100 === 0) log('Sent', offset, 'bytes...');
+    }
+
+    // Send file-end signal
+    dataChannel.send(JSON.stringify({ type: 'file-end' }));
+    log('File send complete. Total bytes sent:', offset);
+  }
+
+  function finalizeReceivedFile(){
+    if(!expectedFileInfo) return;
+    const blob = new Blob(receivedBuffers, { type: expectedFileInfo.type || 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    downloadArea.innerHTML = '';
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = expectedFileInfo.name || 'download.bin';
+    a.textContent = 'Download ' + (expectedFileInfo.name || 'file');
+    a.className = 'download-link';
+    downloadArea.appendChild(a);
+
+    // Also show size and a revoke link
+    const info = document.createElement('div');
+    info.className = 'small muted';
+    info.textContent = `Received ${receivedBytes} bytes.`;
+    downloadArea.appendChild(info);
+
+    log('File assembled and ready for download:', expectedFileInfo.name);
+    // cleanup
+    expectedFileInfo = null;
+    receivedBuffers = []; receivedBytes = 0;
+  }
+
+  // ----- Button handlers -----
+  createOfferBtn.onclick = async () => {
+    if(!fileToSend) {
+      if(!confirm('No file selected. Are you sure you want to create an offer without selecting a file? (Receiver can still create an answer)')){}
+    }
+    resetPeerOnly();
+    makePeer(true); // create datachannel
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    // Wait a short while to gather ICE; then show SDP
+    await wait(500);
+    localSDP.value = JSON.stringify(pc.localDescription);
+    log('Offer created. Copy local SDP and send to remote.');
+  };
+
+  createAnswerBtn.onclick = async () => {
+    resetPeerOnly();
+    makePeer(false); // wait for datachannel
+    // We expect remoteSDP to contain the offer
+    const r = remoteSDP.value.trim();
+    if(!r){
+      alert('Paste the remote offer into the Remote SDP box first (Sender should create offer and paste offer here).');
+      return;
+    }
+    try{
+      const remoteDesc = JSON.parse(r);
+      await pc.setRemoteDescription(remoteDesc);
+    }catch(err){
+      alert('Invalid remote SDP JSON.');
+      return;
+    }
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await wait(500);
+    localSDP.value = JSON.stringify(pc.localDescription);
+    log('Answer created. Copy local SDP (answer) and send back to sender.');
+  };
+
+  setRemoteBtn.onclick = async () => {
+    const text = remoteSDP.value.trim();
+    if(!text) { alert('Paste remote SDP text and then click Set Remote.'); return; }
+    try{
+      const remoteDesc = JSON.parse(text);
+      await pc.setRemoteDescription(remoteDesc);
+      log('Remote description set.');
+    } catch(err){
+      alert('Could not parse or set remote SDP. Make sure it is valid JSON produced by the other side.');
+      console.error(err);
+    }
+  };
+
+  function resetPeerOnly(){
+    if(pc){ try{ pc.close(); } catch(e){} }
+    pc = null; dataChannel = null;
+  }
+
+  function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  // helper to pretty-size
+  function niceBytes(n){
+    if(n < 1024) return n + ' B';
+    if(n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+    if(n < 1024*1024*1024) return (n/1024/1024).toFixed(1) + ' MB';
+    return (n/1024/1024/1024).toFixed(2) + ' GB';
+  }
+
+  // auto-detect pasted remote SDP that seems to be an offer: if user pasted an offer and they press Create Answer, that'll be used.
+  // nothing else
+})();
+</script>
+</body>
+</html>
